@@ -1,0 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Sora:wght@300;400;600&display=swap');
+@import "tailwindcss";
+
+:root {
+  --bg: #0d0f14;
+  --surface: #151820;
+  --border: #1f2333;
+  --accent: #5b6ef5;
+  --accent-glow: rgba(91,110,245,0.18);
+  --green: #3ddba0;
+  --red: #f56e6e;
+  --text: #e8eaf2;
+  --muted: #6b7190;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Sora', sans-serif;
+  min-height: 100vh;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+.pulse { animation: pulse-dot 1.2s infinite; }
