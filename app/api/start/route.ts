@@ -48,6 +48,8 @@ function resolveCookiesFile(): string {
 }
 
 const COOKIES_FILE = resolveCookiesFile();
+console.log("Cookies file:", COOKIES_FILE);
+console.log("Exists:", fs.existsSync(COOKIES_FILE));
 
 const PROXY = process.env.YT_DLP_PROXY || "";
 
