@@ -26,13 +26,44 @@ const FFMPEG_DIR = process.platform === "win32"
   ? "C:\\Users\\Ling Fu\\AppData\\Local\\Microsoft\\WinGet\\Packages\\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-N-124716-g054dffd133-win64-gpl\\bin"
   : "";
 
-// Optional path to a Netscape-format cookies.txt (set YT_DLP_COOKIES on Render).
-// Cookies let yt-dlp authenticate as a real user, which is the only reliable way
-// to get past YouTube's "confirm you're not a bot" block from datacenter IPs.
-const COOKIES_FILE =
-  process.env.YT_DLP_COOKIES && fs.existsSync(process.env.YT_DLP_COOKIES)
-    ? process.env.YT_DLP_COOKIES
-    : "";
+// Cookies let yt-dlp authenticate as a real user — the only reliable way past
+// YouTube's "confirm you're not a bot" block from a datacenter IP (Render).
+//
+// You can supply cookies any of THREE ways (first one found wins):
+//   1. YT_DLP_COOKIES         → absolute path to a cookies.txt file
+//                               (e.g. /etc/secrets/cookies.txt via a Render Secret File)
+//   2. YT_DLP_COOKIES_CONTENT → paste the entire cookies.txt text as an env var;
+//                               it gets written to a temp file at runtime
+//   3. a cookies.txt committed in the project root (process.cwd())
+function resolveCookiesFile(): string {
+  // 1. Explicit path
+  const p = process.env.YT_DLP_COOKIES;
+  if (p && fs.existsSync(p)) return p;
+
+  // 2. Raw content pasted into an env var
+  const content = process.env.YT_DLP_COOKIES_CONTENT;
+  if (content && content.trim()) {
+    const tmp = path.join(DOWNLOAD_DIR, ".cookies.txt");
+    try {
+      fs.writeFileSync(tmp, content, { mode: 0o600 });
+      return tmp;
+    } catch {
+      /* fall through */
+    }
+  }
+
+  // 3. cookies.txt sitting in the project root
+  const local = path.join(process.cwd(), "cookies.txt");
+  if (fs.existsSync(local)) return local;
+
+  return "";
+}
+
+const COOKIES_FILE = resolveCookiesFile();
+
+// Optional outbound proxy (e.g. a residential proxy) — another way past the
+// datacenter-IP block. Set YT_DLP_PROXY to something like http://user:pass@host:port
+const PROXY = process.env.YT_DLP_PROXY || "";
 
 // Args that improve the odds of getting past YouTube's bot detection on servers.
 // Alternate player clients ("tv"/"android") often bypass the check without login.
@@ -41,6 +72,7 @@ const resilienceArgs = [
   "--retries", "5",
   "--fragment-retries", "5",
   ...(COOKIES_FILE ? ["--cookies", COOKIES_FILE] : []),
+  ...(PROXY ? ["--proxy", PROXY] : []),
 ];
 
 export async function POST(req: NextRequest) {
