@@ -4,17 +4,10 @@ FROM node:22-alpine
 # python3/pip are needed to install yt-dlp.
 RUN apk add --no-cache ffmpeg python3 py3-pip
 
-# Install yt-dlp. On Alpine, pip places the console script in /usr/bin.
-RUN pip3 install --no-cache-dir --break-system-packages yt-dlp
-
-# Guarantee yt-dlp is resolvable from PATH under both common locations,
-# so a bare "yt-dlp" spawn works regardless of where pip put it.
-RUN YT=$(command -v yt-dlp) \
-    && ln -sf "$YT" /usr/local/bin/yt-dlp \
-    && ln -sf "$YT" /usr/bin/yt-dlp \
+# Install yt-dlp. pip places the console script on PATH (e.g. /usr/local/bin),
+# so a bare "yt-dlp" spawn resolves it. Verify the install at build time.
+RUN pip3 install --no-cache-dir --break-system-packages yt-dlp \
     && yt-dlp --version
-
-ENV YT_DLP_PATH=/usr/local/bin/yt-dlp
 
 WORKDIR /app
 COPY package*.json ./
