@@ -105,8 +105,15 @@ export async function POST(req: NextRequest) {
   const args =
     format === "mp3"
       ? ["-x", "--audio-format", "mp3", "--audio-quality", "192K", ...commonArgs]
-      : ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-         "--merge-output-format", "mp4", ...commonArgs];
+      : [
+          // Prefer mp4/m4a, but fall back to ANY best video+audio (or a single
+          // combined stream) so it never errors with "format not available".
+          // ffmpeg then merges/remuxes the result into an .mp4 container.
+          "-f",
+          "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+          "--merge-output-format", "mp4",
+          ...commonArgs,
+        ];
 
   // Collect stderr so we can surface the REAL yt-dlp error to the user
   const stderrLines: string[] = [];
