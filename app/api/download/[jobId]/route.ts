@@ -15,15 +15,17 @@ export const jobs: Record<string, {
 const DOWNLOAD_DIR = path.join(process.cwd(), "downloads");
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
-// Windows → use local yt-dlp.exe, Linux/Mac → use system yt-dlp
-const YT_DLP = process.platform === "win32"
-  ? path.join(process.cwd(), "yt-dlp.exe")
-  : "yt-dlp";
+// Windows → use local yt-dlp.exe, Linux/Mac → use system yt-dlp (installed via pip in Docker)
+const YT_DLP =
+  process.platform === "win32"
+    ? path.join(process.cwd(), "yt-dlp.exe")
+    : process.env.YT_DLP_PATH || "/usr/local/bin/yt-dlp";
 
-// Windows needs explicit ffmpeg path, Linux has it in PATH
-const FFMPEG_DIR = process.platform === "win32"
-  ? "C:\\Users\\Ling Fu\\AppData\\Local\\Microsoft\\WinGet\\Packages\\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-N-124716-g054dffd133-win64-gpl\\bin"
-  : "";
+// Windows needs an explicit ffmpeg path; on Linux it's in PATH via apk/apt
+const FFMPEG_LOCATION =
+  process.platform === "win32"
+    ? "C:\\Users\\Ling Fu\\AppData\\Local\\Microsoft\\WinGet\\Packages\\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-N-124716-g054dffd133-win64-gpl\\bin"
+    : ""; // empty = not passed; ffmpeg is on PATH in the Docker container
 
 export async function POST(req: NextRequest) {
   const { url, format } = await req.json();
@@ -42,7 +44,9 @@ export async function POST(req: NextRequest) {
     ...speedArgs,
     "--newline",
     "--progress",
-    ...(FFMPEG_DIR ? ["--ffmpeg-location", FFMPEG_DIR] : []),
+    "--no-playlist",
+    // Only pass --ffmpeg-location on Windows; on Linux ffmpeg is already in PATH
+    ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
     "-o", outputTemplate,
     url,
   ];
@@ -50,17 +54,32 @@ export async function POST(req: NextRequest) {
   const args =
     format === "mp3"
       ? ["-x", "--audio-format", "mp3", "--audio-quality", "192K", ...commonArgs]
-      : ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-         "--merge-output-format", "mp4", ...commonArgs];
+      : [
+          "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+          "--merge-output-format", "mp4",
+          ...commonArgs,
+        ];
 
-  const proc = spawn(YT_DLP, args);
+  // Collect stderr lines so we can surface the real error message
+  const stderrLines: string[] = [];
+
+  const proc = spawn(YT_DLP, args, {
+    // Ensure the system PATH is available (important on some Linux envs)
+    env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+  });
 
   const handleLine = (line: string) => {
-    const pct = line.match(/\[download\]\s+([\d.]+)%/);
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    // Parse download percentage: [download] 42.3% of ...
+    const pct = trimmed.match(/\[download\]\s+([\d.]+)%/);
     if (pct) {
       jobs[jobId].progress = Math.min(99, Math.floor(parseFloat(pct[1])));
     }
-    const destMatch = line.match(/Destination: .+[/\\][a-f0-9]{8}_(.+)\.\w+$/);
+
+    // Parse destination filename to extract title
+    const destMatch = trimmed.match(/Destination: .+[/\\][a-f0-9]{8}_(.+)\.\w+$/);
     if (destMatch) jobs[jobId].title = destMatch[1];
   };
 
@@ -69,7 +88,12 @@ export async function POST(req: NextRequest) {
   });
 
   proc.stderr.on("data", (chunk: Buffer) => {
-    chunk.toString().split("\n").forEach(handleLine);
+    const lines = chunk.toString().split("\n");
+    lines.forEach(line => {
+      const trimmed = line.trim();
+      if (trimmed) stderrLines.push(trimmed);
+      handleLine(line); // yt-dlp also writes progress to stderr sometimes
+    });
   });
 
   proc.on("close", (code: number) => {
@@ -84,10 +108,21 @@ export async function POST(req: NextRequest) {
       jobs[jobId].progress = 100;
     } else {
       jobs[jobId].status = "error";
-      if (!jobs[jobId].error) {
-        jobs[jobId].error = "Download failed. Check the URL and try again.";
-      }
+      // Surface the real yt-dlp error instead of a generic message
+      const relevantError = stderrLines
+        .filter(l => l.includes("ERROR") || l.includes("error") || l.includes("Warning"))
+        .pop();
+      jobs[jobId].error =
+        relevantError ||
+        stderrLines.slice(-3).join(" ") ||
+        "Download failed. Check the URL and try again.";
     }
+  });
+
+  proc.on("error", (err) => {
+    // Fires if yt-dlp binary is not found or not executable
+    jobs[jobId].status = "error";
+    jobs[jobId].error = `Failed to start yt-dlp: ${err.message}. Check that yt-dlp is installed in the Docker container.`;
   });
 
   return NextResponse.json({ job_id: jobId });
