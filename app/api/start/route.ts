@@ -26,6 +26,23 @@ const FFMPEG_DIR = process.platform === "win32"
   ? "C:\\Users\\Ling Fu\\AppData\\Local\\Microsoft\\WinGet\\Packages\\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-N-124716-g054dffd133-win64-gpl\\bin"
   : "";
 
+// Optional path to a Netscape-format cookies.txt (set YT_DLP_COOKIES on Render).
+// Cookies let yt-dlp authenticate as a real user, which is the only reliable way
+// to get past YouTube's "confirm you're not a bot" block from datacenter IPs.
+const COOKIES_FILE =
+  process.env.YT_DLP_COOKIES && fs.existsSync(process.env.YT_DLP_COOKIES)
+    ? process.env.YT_DLP_COOKIES
+    : "";
+
+// Args that improve the odds of getting past YouTube's bot detection on servers.
+// Alternate player clients ("tv"/"android") often bypass the check without login.
+const resilienceArgs = [
+  "--extractor-args", "youtube:player_client=tv,android,web",
+  "--retries", "5",
+  "--fragment-retries", "5",
+  ...(COOKIES_FILE ? ["--cookies", COOKIES_FILE] : []),
+];
+
 export async function POST(req: NextRequest) {
   const { url, format } = await req.json();
   const jobId = randomBytes(4).toString("hex");
@@ -45,6 +62,7 @@ export async function POST(req: NextRequest) {
 
   const commonArgs = [
     ...speedArgs,
+    ...resilienceArgs,
     "--newline",
     "--progress",
     ...(FFMPEG_DIR ? ["--ffmpeg-location", FFMPEG_DIR] : []),
@@ -58,7 +76,12 @@ export async function POST(req: NextRequest) {
       : ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
          "--merge-output-format", "mp4", ...commonArgs];
 
-  const proc = spawn(YT_DLP, args);
+  // Collect stderr so we can surface the REAL yt-dlp error to the user
+  const stderrLines: string[] = [];
+
+  const proc = spawn(YT_DLP, args, {
+    env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+  });
 
   const handleLine = (line: string) => {
     // Progress line: [download]  42.3% of   5.23MiB at  1.20MiB/s ETA 00:03
@@ -77,7 +100,11 @@ export async function POST(req: NextRequest) {
   });
 
   proc.stderr.on("data", (chunk: Buffer) => {
-    chunk.toString().split("\n").forEach(handleLine);
+    chunk.toString().split("\n").forEach((line) => {
+      const trimmed = line.trim();
+      if (trimmed) stderrLines.push(trimmed);
+      handleLine(line);
+    });
   });
 
   proc.on("close", (code: number) => {
@@ -92,10 +119,21 @@ export async function POST(req: NextRequest) {
       jobs[jobId].progress = 100;
     } else {
       jobs[jobId].status = "error";
-      if (!jobs[jobId].error) {
-        jobs[jobId].error = "Download failed. Check the URL and try again.";
-      }
+      // Surface the real yt-dlp error instead of a generic message
+      const relevantError = stderrLines
+        .filter(l => l.includes("ERROR") || l.includes("error"))
+        .pop();
+      jobs[jobId].error =
+        relevantError ||
+        stderrLines.slice(-3).join(" ") ||
+        "Download failed. Check the URL and try again.";
     }
+  });
+
+  // Fires if the yt-dlp binary cannot be spawned at all
+  proc.on("error", (err) => {
+    jobs[jobId].status = "error";
+    jobs[jobId].error = `Failed to start yt-dlp: ${err.message}`;
   });
 
   return NextResponse.json({ job_id: jobId });
