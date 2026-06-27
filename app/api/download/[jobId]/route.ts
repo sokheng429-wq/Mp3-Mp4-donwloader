@@ -1,129 +1,81 @@
 import { NextRequest, NextResponse } from "next/server";
-import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
-import { randomBytes } from "crypto";
+import { Readable } from "stream";
+import { jobs } from "../../start/route";
 
-export const jobs: Record<string, {
-  status: "downloading" | "done" | "error";
-  progress: number;
-  title?: string;
-  filename?: string;
-  error?: string;
-}> = {};
+// This route runs on the Node.js runtime (needs fs + streams)
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 const DOWNLOAD_DIR = path.join(process.cwd(), "downloads");
-if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 
-// Windows → use local yt-dlp.exe, Linux/Mac → use system yt-dlp (installed via pip in Docker)
-const YT_DLP =
-  process.platform === "win32"
-    ? path.join(process.cwd(), "yt-dlp.exe")
-    : process.env.YT_DLP_PATH || "/usr/local/bin/yt-dlp";
+// Pick a sensible Content-Type from the file extension
+function contentTypeFor(ext: string): string {
+  switch (ext.toLowerCase()) {
+    case ".mp3":
+      return "audio/mpeg";
+    case ".m4a":
+      return "audio/mp4";
+    case ".mp4":
+      return "video/mp4";
+    case ".webm":
+      return "video/webm";
+    case ".mkv":
+      return "video/x-matroska";
+    default:
+      return "application/octet-stream";
+  }
+}
 
-// Windows needs an explicit ffmpeg path; on Linux it's in PATH via apk/apt
-const FFMPEG_LOCATION =
-  process.platform === "win32"
-    ? "C:\\Users\\Ling Fu\\AppData\\Local\\Microsoft\\WinGet\\Packages\\yt-dlp.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-N-124716-g054dffd133-win64-gpl\\bin"
-    : ""; // empty = not passed; ffmpeg is on PATH in the Docker container
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: Promise<{ jobId: string }> }
+) {
+  const { jobId } = await params;
+  const job = jobs[jobId];
 
-export async function POST(req: NextRequest) {
-  const { url, format } = await req.json();
-  const jobId = randomBytes(4).toString("hex");
-  const outputTemplate = path.join(DOWNLOAD_DIR, `${jobId}_%(title)s.%(ext)s`);
+  // Figure out which file to serve. Prefer the filename recorded on the job,
+  // but fall back to scanning the downloads folder by jobId prefix so a serving
+  // works even if the in-memory record was lost.
+  let filename = job?.filename;
+  if (!filename && fs.existsSync(DOWNLOAD_DIR)) {
+    const match = fs.readdirSync(DOWNLOAD_DIR).find(f => f.startsWith(jobId));
+    if (match) filename = match;
+  }
 
-  jobs[jobId] = { status: "downloading", progress: 0 };
+  if (!filename) {
+    return NextResponse.json(
+      { error: "File not found or not ready yet." },
+      { status: 404 }
+    );
+  }
 
-  const speedArgs = [
-    "--concurrent-fragments", "4",
-    "--no-part",
-    "--buffer-size", "16K",
-  ];
+  const filePath = path.join(DOWNLOAD_DIR, filename);
+  if (!fs.existsSync(filePath)) {
+    return NextResponse.json({ error: "File no longer available." }, { status: 404 });
+  }
 
-  const commonArgs = [
-    ...speedArgs,
-    "--newline",
-    "--progress",
-    "--no-playlist",
-    // Only pass --ffmpeg-location on Windows; on Linux ffmpeg is already in PATH
-    ...(FFMPEG_LOCATION ? ["--ffmpeg-location", FFMPEG_LOCATION] : []),
-    "-o", outputTemplate,
-    url,
-  ];
+  const ext = path.extname(filename);
+  // Strip the "<jobId>_" prefix so the user gets a clean filename
+  const downloadName = filename.replace(`${jobId}_`, "") || `download${ext}`;
 
-  const args =
-    format === "mp3"
-      ? ["-x", "--audio-format", "mp3", "--audio-quality", "192K", ...commonArgs]
-      : [
-          "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-          "--merge-output-format", "mp4",
-          ...commonArgs,
-        ];
+  const stat = fs.statSync(filePath);
+  const nodeStream = fs.createReadStream(filePath);
+  // Convert the Node stream to a Web ReadableStream so we can stream the
+  // response without loading the whole file into memory (mp4 files are large).
+  const webStream = Readable.toWeb(nodeStream) as ReadableStream;
 
-  // Collect stderr lines so we can surface the real error message
-  const stderrLines: string[] = [];
+  // RFC 5987 encoding so non-ASCII titles (e.g. Khmer) work in the filename
+  const asciiName = downloadName.replace(/[^\x20-\x7E]/g, "_");
+  const utf8Name = encodeURIComponent(downloadName);
 
-  const proc = spawn(YT_DLP, args, {
-    // Ensure the system PATH is available (important on some Linux envs)
-    env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
+  return new Response(webStream, {
+    headers: {
+      "Content-Type": contentTypeFor(ext),
+      "Content-Length": String(stat.size),
+      "Content-Disposition": `attachment; filename="${asciiName}"; filename*=UTF-8''${utf8Name}`,
+      "Cache-Control": "no-store",
+    },
   });
-
-  const handleLine = (line: string) => {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-
-    // Parse download percentage: [download] 42.3% of ...
-    const pct = trimmed.match(/\[download\]\s+([\d.]+)%/);
-    if (pct) {
-      jobs[jobId].progress = Math.min(99, Math.floor(parseFloat(pct[1])));
-    }
-
-    // Parse destination filename to extract title
-    const destMatch = trimmed.match(/Destination: .+[/\\][a-f0-9]{8}_(.+)\.\w+$/);
-    if (destMatch) jobs[jobId].title = destMatch[1];
-  };
-
-  proc.stdout.on("data", (chunk: Buffer) => {
-    chunk.toString().split("\n").forEach(handleLine);
-  });
-
-  proc.stderr.on("data", (chunk: Buffer) => {
-    const lines = chunk.toString().split("\n");
-    lines.forEach(line => {
-      const trimmed = line.trim();
-      if (trimmed) stderrLines.push(trimmed);
-      handleLine(line); // yt-dlp also writes progress to stderr sometimes
-    });
-  });
-
-  proc.on("close", (code: number) => {
-    if (code === 0) {
-      const files = fs.readdirSync(DOWNLOAD_DIR).filter(f => f.startsWith(jobId));
-      if (files.length) {
-        jobs[jobId].filename = files[0];
-        const raw = files[0].replace(`${jobId}_`, "").replace(/\.[^.]+$/, "");
-        if (!jobs[jobId].title) jobs[jobId].title = raw;
-      }
-      jobs[jobId].status = "done";
-      jobs[jobId].progress = 100;
-    } else {
-      jobs[jobId].status = "error";
-      // Surface the real yt-dlp error instead of a generic message
-      const relevantError = stderrLines
-        .filter(l => l.includes("ERROR") || l.includes("error") || l.includes("Warning"))
-        .pop();
-      jobs[jobId].error =
-        relevantError ||
-        stderrLines.slice(-3).join(" ") ||
-        "Download failed. Check the URL and try again.";
-    }
-  });
-
-  proc.on("error", (err) => {
-    // Fires if yt-dlp binary is not found or not executable
-    jobs[jobId].status = "error";
-    jobs[jobId].error = `Failed to start yt-dlp: ${err.message}. Check that yt-dlp is installed in the Docker container.`;
-  });
-
-  return NextResponse.json({ job_id: jobId });
 }
