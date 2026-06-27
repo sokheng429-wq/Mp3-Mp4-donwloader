@@ -52,7 +52,6 @@ const COOKIES_FILE = resolveCookiesFile();
 const PROXY = process.env.YT_DLP_PROXY || "";
 
 const resilienceArgs = [
-  "--extractor-args", "youtube:player_client=tv,android,web",
   "--retries", "5",
   "--fragment-retries", "5",
   ...(COOKIES_FILE ? ["--cookies", COOKIES_FILE] : []),
@@ -88,20 +87,18 @@ export async function POST(req: NextRequest) {
       ? ["-x", "--audio-format", "mp3", "--audio-quality", "192K", ...commonArgs]
       : [
           "-f",
-          // Stage 1: best mp4 video + m4a audio (ideal quality)
-          // Stage 2: any best separate streams yt-dlp can find and merge
-          // Stage 3: best single combined mp4 stream (no merge needed)
-          // Stage 4: absolute fallback — whatever is available
-          "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best",
-          "--merge-output-format", "mp4",
+          "bv*+ba/b",
+          "--merge-output-format",
+          "mp4",
           ...commonArgs,
         ];
 
   const stderrLines: string[] = [];
 
-  const proc = spawn(YT_DLP, args, {
-    env: { ...process.env, PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin" },
-  });
+  console.log("YT_DLP:", YT_DLP);
+  console.log("ARGS:", args.join(" "));
+
+  const proc = spawn(YT_DLP, args);
 
   const handleLine = (line: string) => {
     const pct = line.match(/\[download\]\s+([\d.]+)%/);
